@@ -397,17 +397,18 @@ function toTitleCase(s) {
 
 function sendTelegram(text, filePath) {
   return new Promise((resolve, reject) => {
-    // Try to read token from openclaw config
-    const configPaths = [
-      path.join(os.homedir(), '.openclaw', 'config.json'),
-      path.join(os.homedir(), '.openclaw', 'workspace', 'TOOLS.md'),
-    ];
-    // Use env var if set
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
+    // Read token from openclaw config (same as all other projects)
+    let token, chatId;
+    try {
+      const ocConfig = JSON.parse(fs.readFileSync(
+        path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'
+      ));
+      token = ocConfig.channels?.telegram?.botToken;
+      chatId = '687053516';
+    } catch (e) {}
 
     if (!token || !chatId) {
-      console.log('⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set. Skipping send.');
+      console.log('⚠️  Could not read Telegram config from ~/.openclaw/openclaw.json. Skipping send.');
       resolve();
       return;
     }
@@ -1297,17 +1298,9 @@ function cmdReport(args) {
   console.log(`\n📄 Report saved: ${reportFile}\n`);
 
   if (send) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) {
-      // Try to use openclaw channel instead — just print the path
-      console.log('⚠️  Telegram env vars not set. Report file saved but not sent.');
-      console.log(`   Path: ${reportFile}`);
-    } else {
-      sendTelegram(null, reportFile)
-        .then(() => console.log('✅ Report sent to Telegram'))
-        .catch(e => console.error('Failed to send:', e.message));
-    }
+    sendTelegram(null, reportFile)
+      .then(() => console.log('✅ Report sent to Telegram'))
+      .catch(e => console.error('Failed to send:', e.message));
   }
 }
 
