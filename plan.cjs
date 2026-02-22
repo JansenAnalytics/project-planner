@@ -280,6 +280,101 @@ function getDownstream(taskId, tasks) {
 }
 
 // ─────────────────────────────────────────────
+// Subtask helpers
+// ─────────────────────────────────────────────
+
+function findTask(plan, taskId) {
+  const t = (plan.tasks || []).find(t => t.id === taskId);
+  if (!t) die(`Task "${taskId}" not found in plan.`);
+  return t;
+}
+
+function findSubtask(task, stId) {
+  const st = (task.subtasks || []).find(s => s.id === stId);
+  if (!st) die(`Subtask "${stId}" not found in task "${task.id}".`);
+  return st;
+}
+
+function detectSubtaskCycles(subtasks) {
+  const byId = {};
+  for (const s of subtasks) byId[s.id] = s;
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = {};
+  for (const s of subtasks) color[s.id] = WHITE;
+
+  function dfs(id, stack) {
+    color[id] = GRAY;
+    const st = byId[id];
+    if (!st) return null;
+    for (const dep of (st.requires || [])) {
+      if (color[dep] === GRAY) {
+        return `Subtask cycle detected: ${[...stack, dep].join(' → ')}`;
+      }
+      if (color[dep] === WHITE) {
+        const result = dfs(dep, [...stack, dep]);
+        if (result) return result;
+      }
+    }
+    color[id] = BLACK;
+    return null;
+  }
+
+  for (const s of subtasks) {
+    if (color[s.id] === WHITE) {
+      const err = dfs(s.id, [s.id]);
+      if (err) return err;
+    }
+  }
+  return null;
+}
+
+function getSubtaskDownstream(stId, subtasks) {
+  const direct = subtasks.filter(s => (s.requires || []).includes(stId));
+  const visited = new Set(direct.map(s => s.id));
+  const queue = [...direct];
+  while (queue.length) {
+    const curr = queue.shift();
+    const nexts = subtasks.filter(s => (s.requires || []).includes(curr.id));
+    for (const n of nexts) {
+      if (!visited.has(n.id)) {
+        visited.add(n.id);
+        queue.push(n);
+      }
+    }
+  }
+  return { direct, transitive: subtasks.filter(s => visited.has(s.id) && !direct.find(d => d.id === s.id)) };
+}
+
+function getReadySubtasks(subtasks) {
+  const done = new Set(subtasks.filter(s => s.status === 'done').map(s => s.id));
+  return subtasks.filter(s =>
+    s.status === 'pending' &&
+    (s.requires || []).every(dep => done.has(dep))
+  );
+}
+
+function buildSubtaskObj(t, now) {
+  return {
+    id: t.id,
+    name: t.name || '',
+    description: t.description || '',
+    status: 'pending',
+    requires: t.requires || [],
+    produces: t.produces || [],
+    acceptance_criteria: t.criteria || t.acceptance_criteria || [],
+    rollback: t.rollback || '',
+    assigned_to: t.assigned || t.assigned_to || 'sub-agent',
+    estimated_hours: t.hours || t.estimated_hours || 0,
+    tags: t.tags || [],
+    priority: t.priority || 'medium',
+    started_at: null,
+    completed_at: null,
+    blocker: null,
+    notes: []
+  };
+}
+
+// ─────────────────────────────────────────────
 // PLAN.md generation
 // ─────────────────────────────────────────────
 
@@ -346,6 +441,18 @@ function regeneratePlanMd(dir, plan) {
       const ago = t.started_at ? `started ${timeAgo(t.started_at)}` : '';
       const assigned = t.assigned_to || '—';
       md += `- **${t.id}** ${t.name} *(${assigned} · est ${t.estimated_hours || '?'}h · ${ago})*\n`;
+      if (t.subtasks && t.subtasks.length > 0) {
+        const stDone = t.subtasks.filter(s => ['done','skipped','cancelled'].includes(s.status)).length;
+        const stTotal = t.subtasks.length;
+        for (const st of t.subtasks) {
+          const icon = statusIcon(st.status);
+          const dur = st.status === 'done' && st.started_at ? ` (${formatDuration(st.started_at, st.completed_at)})` : '';
+          const running_note = st.status === 'running' ? ' ← running' : '';
+          const waiting = (st.status === 'pending' && (st.requires || []).length > 0) ? ` ← waiting on ${(st.requires || []).join(', ')}` : '';
+          md += `  - ${icon} \`${st.id}\` ${st.name}${dur}${running_note}${waiting}\n`;
+        }
+        md += `\n  **Subtask progress:** ${progressBar(stDone, stTotal)} ${stDone}/${stTotal}\n`;
+      }
     }
   }
 
@@ -669,8 +776,21 @@ function cmdStatus(args) {
 
   if ((byStatus.done || []).length > 0)
     console.log(`✅ Done (${done}):        ${byStatus.done.map(t => t.id).join(', ')}`);
-  if (running.length > 0)
-    console.log(`▶  Running (${running.length}):     ${running.map(t => t.id).join(', ')}`);
+  if (running.length > 0) {
+    console.log(`▶  Running (${running.length}):`);
+    for (const t of running) {
+      const assigned = t.assigned_to || '—';
+      const ago = t.started_at ? `started ${timeAgo(t.started_at)}` : '';
+      console.log(`  ${t.id.padEnd(12)} ${t.name.padEnd(30)} [${assigned} · est ${t.estimated_hours || '?'}h · ${ago}]`);
+      if (t.subtasks && t.subtasks.length > 0) {
+        const stDone = t.subtasks.filter(s => ['done','skipped','cancelled'].includes(s.status)).length;
+        const stTotal = t.subtasks.length;
+        const bar = progressBar(stDone, stTotal);
+        const stIcons = t.subtasks.map(s => `${statusIcon(s.status)}${s.id}`).join(' ');
+        console.log(`    Subtasks: ${bar} ${stDone}/${stTotal} — ${stIcons}`);
+      }
+    }
+  }
   if (blocked.length > 0)
     console.log(`🔴 Blocked (${blocked.length}):     ${blocked.map(t => t.id).join(', ')}`);
   if (failed.length > 0)
@@ -718,6 +838,19 @@ function cmdNext(args) {
   for (const t of ready) {
     const pad = s => s.padEnd(24);
     console.log(`  ${t.id.padEnd(10)} ${pad(t.name)}  priority=${t.priority || '?'}  assigned=${t.assigned_to || '?'}  est=${t.estimated_hours || '?'}h`);
+    if (t.subtasks && t.subtasks.length > 0) {
+      const readySts = getReadySubtasks(t.subtasks);
+      if (readySts.length > 0) {
+        const first = readySts[0];
+        const depMsg = (first.requires || []).length === 0 ? '(no dependencies)' : `(needs: ${first.requires.join(', ')})`;
+        console.log(`    → First subtask: ${first.id} "${first.name}" ${depMsg}`);
+        console.log(`    → Run: plan.cjs subtask start --task ${t.id} --id ${first.id} --project ${args.project}`);
+      } else {
+        console.log(`    → No subtasks ready (${t.subtasks.length} subtasks not yet started)`);
+      }
+    } else {
+      console.log(`    → No subtasks defined yet`);
+    }
   }
 
   const subAgentTasks = ready.filter(t => t.assigned_to === 'sub-agent');
@@ -843,6 +976,23 @@ function cmdStart(args) {
   if (depResults.length > 0) {
     console.log(`\n  Dependencies: ${depResults.join(', ')}`);
   }
+
+  if (task.subtasks && task.subtasks.length > 0) {
+    const stCount = task.subtasks.length;
+    console.log(`\nSubtask plan (${stCount} subtask${stCount > 1 ? 's' : ''} — run \`plan.cjs subtask parallel --task ${taskId}\` for execution waves):`);
+    for (const st of task.subtasks) {
+      const icon = statusIcon(st.status);
+      const needsPart = (st.requires || []).length > 0 ? `, needs: ${st.requires.join(', ')}` : '';
+      console.log(`  ${icon} ${st.id.padEnd(8)} ${st.name.padEnd(32)} [${st.priority || '?'}, ${st.estimated_hours || 0}h${needsPart}]`);
+    }
+    const readySts = getReadySubtasks(task.subtasks);
+    if (readySts.length > 0) {
+      const first = readySts[0];
+      const depMsg = (first.requires || []).length === 0 ? '(no dependencies)' : `(needs: ${first.requires.join(', ')})`;
+      console.log(`\nFirst runnable: ${first.id} "${first.name}" ${depMsg}`);
+      console.log(`Run: plan.cjs subtask start --task ${taskId} --id ${first.id} --project ${project}`);
+    }
+  }
   console.log('');
 }
 
@@ -850,6 +1000,7 @@ function cmdDone(args) {
   const taskId = args.task;
   if (!taskId) die('--task is required');
   const confirm = args.confirm === true || args.confirm === 'true';
+  const force = args.force === true || args.force === 'true';
   const note = args.note;
 
   const project = args.project;
@@ -860,6 +1011,16 @@ function cmdDone(args) {
   const task = tasks.find(t => t.id === taskId);
   if (!task) die(`Task "${taskId}" not found`);
   if (task.status === 'done') die(`Task "${taskId}" is already done`);
+
+  // Gate on subtasks
+  if (!force) {
+    const undoneSubtasks = (task.subtasks || []).filter(s => !['done','skipped','cancelled'].includes(s.status));
+    if (undoneSubtasks.length > 0) {
+      die(`Cannot mark task done — ${undoneSubtasks.length} subtask(s) not yet complete:\n` +
+        undoneSubtasks.map(s => `  ${s.id} [${s.status}]: ${s.name}`).join('\n') +
+        '\n\nComplete all subtasks first, or use --force to override.');
+    }
+  }
 
   console.log(`\n✅ Completing ${taskId}: ${task.name}\n`);
 
@@ -1339,6 +1500,676 @@ function cmdList(args) {
 }
 
 // ─────────────────────────────────────────────
+// Subtask commands
+// ─────────────────────────────────────────────
+
+function subtaskAdd(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const name = args.name;
+  if (!name) die('--name is required');
+
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  task.subtasks = task.subtasks || [];
+
+  // No duplicate ID
+  if (task.subtasks.find(s => s.id === stId)) die(`Subtask ID "${stId}" already exists in task "${taskId}"`);
+
+  // All requires must already exist in this task's subtasks
+  const requires = splitComma(args.requires === true ? '' : (args.requires || ''));
+  for (const dep of requires) {
+    if (dep && !task.subtasks.find(s => s.id === dep)) die(`Required subtask "${dep}" does not exist in task "${taskId}"`);
+  }
+
+  const st = buildSubtaskObj({
+    id: stId,
+    name,
+    requires,
+    produces: splitComma(args.produces === true ? '' : (args.produces || '')),
+    criteria: splitComma(args.criteria === true ? '' : (args.criteria || '')),
+    rollback: args.rollback || '',
+    assigned: args.assigned || 'sub-agent',
+    hours: args.hours ? parseFloat(args.hours) : 0,
+    priority: args.priority || 'medium',
+    tags: splitComma(args.tags === true ? '' : (args.tags || ''))
+  });
+
+  // Cycle detection
+  const testSubtasks = [...task.subtasks, st];
+  const cycleErr = detectSubtaskCycles(testSubtasks);
+  if (cycleErr) die(cycleErr);
+
+  task.subtasks.push(st);
+  savePlan(dir, plan);
+  console.log(`Added subtask ${stId} "${name}" to ${taskId}`);
+}
+
+function subtaskImport(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  let file = args.file;
+  if (!file) die('--file is required');
+
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  let raw;
+  if (file === '-') {
+    raw = fs.readFileSync('/dev/stdin', 'utf8');
+  } else {
+    file = resolvePath(file);
+    if (!fs.existsSync(file)) die(`File not found: ${file}`);
+    raw = fs.readFileSync(file, 'utf8');
+  }
+
+  let importedItems;
+  try { importedItems = JSON.parse(raw); }
+  catch(e) { die(`Invalid JSON: ${e.message}`); }
+
+  if (!Array.isArray(importedItems)) die('Subtasks file must be a JSON array');
+
+  task.subtasks = task.subtasks || [];
+
+  const errors = [];
+  const normalized = importedItems.map((t, i) => {
+    if (!t.id) errors.push(`Subtask at index ${i}: missing "id"`);
+    if (!t.name) errors.push(`Subtask at index ${i} (${t.id || '?'}): missing "name"`);
+    return buildSubtaskObj(t);
+  });
+
+  // Unique within import set
+  const seenIds = new Set();
+  for (const st of normalized) {
+    if (st.id && seenIds.has(st.id)) errors.push(`Duplicate subtask ID in import: "${st.id}"`);
+    if (st.id) seenIds.add(st.id);
+  }
+
+  // Unique against existing subtasks
+  for (const st of normalized) {
+    if (st.id && task.subtasks.find(s => s.id === st.id)) errors.push(`Subtask "${st.id}" already exists in task "${taskId}"`);
+  }
+
+  // Validate requires
+  const allStIds = new Set([...task.subtasks.map(s => s.id), ...normalized.map(s => s.id)]);
+  for (const st of normalized) {
+    for (const dep of (st.requires || [])) {
+      if (!allStIds.has(dep)) errors.push(`Subtask "${st.id}" requires "${dep}" which doesn't exist`);
+    }
+  }
+
+  if (errors.length > 0) {
+    console.error('\x1b[31mSubtask import failed — errors:\x1b[0m');
+    errors.forEach(e => console.error(`  • ${e}`));
+    process.exit(1);
+  }
+
+  // Cycle detection on full set
+  const allSubtasks = [...task.subtasks, ...normalized];
+  const cycleErr = detectSubtaskCycles(allSubtasks);
+  if (cycleErr) die(cycleErr);
+
+  task.subtasks = allSubtasks;
+  savePlan(dir, plan);
+
+  console.log(`\n✅ Imported ${normalized.length} subtasks into ${taskId} (${project})`);
+  console.log(`   Total subtasks: ${task.subtasks.length}`);
+  const noDeps = normalized.filter(s => (s.requires || []).length === 0);
+  const withDeps = normalized.filter(s => (s.requires || []).length > 0);
+  console.log(`   Root subtasks (no deps): ${noDeps.map(s => s.id).join(', ') || 'none'}`);
+  console.log(`   Subtasks with deps: ${withDeps.length}`);
+}
+
+function subtaskList(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  const subtasks = task.subtasks || [];
+  if (subtasks.length === 0) {
+    console.log(`\nNo subtasks defined for ${taskId}: ${task.name}\n`);
+    return;
+  }
+
+  const stDone = subtasks.filter(s => ['done','skipped','cancelled'].includes(s.status)).length;
+  const stTotal = subtasks.length;
+  const pct = stTotal ? Math.round((stDone / stTotal) * 100) : 0;
+
+  console.log(`\nSubtasks for ${taskId}: ${task.name}`);
+  console.log(`Progress: ${progressBar(stDone, stTotal)} ${stDone}/${stTotal} (${pct}%)\n`);
+
+  console.log(`${'ID'.padEnd(8)} ${'Status'.padEnd(12)} ${'Pri'.padEnd(10)} ${'Est'.padEnd(7)} ${'Requires'.padEnd(14)} Name`);
+  console.log('─'.repeat(70));
+  for (const st of subtasks) {
+    const icon = statusIcon(st.status);
+    const reqs = (st.requires || []).join(',') || '—';
+    const pri = (st.priority || '?').padEnd(10);
+    const est = `${st.estimated_hours || 0}h`.padEnd(7);
+    console.log(`${st.id.padEnd(8)} ${(icon + ' ' + st.status).padEnd(12)} ${pri} ${est} ${reqs.padEnd(14)} ${st.name}`);
+  }
+
+  // Critical path among subtasks
+  const cp = computeCriticalPath(subtasks);
+  if (cp.path.length > 0) {
+    console.log(`\nCritical path: ${cp.path.join(' → ')} (${cp.totalHours}h)`);
+  }
+
+  const remaining = subtasks
+    .filter(s => !['done','skipped','cancelled'].includes(s.status))
+    .reduce((sum, s) => sum + (s.estimated_hours || 0), 0);
+  console.log(`Estimated remaining: ${remaining}h\n`);
+}
+
+function subtaskNext(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  const subtasks = task.subtasks || [];
+  const ready = getReadySubtasks(subtasks);
+
+  if (ready.length === 0) {
+    console.log(`\nNo subtasks ready to start in ${taskId}.`);
+    const running = subtasks.filter(s => s.status === 'running');
+    if (running.length) console.log(`Currently running: ${running.map(s => s.id).join(', ')}`);
+    console.log('');
+    return;
+  }
+
+  const running = subtasks.filter(s => s.status === 'running');
+  console.log(`\nReady to start in ${taskId} (${ready.length} subtask${ready.length > 1 ? 's' : ''}):\n`);
+  for (const st of ready) {
+    console.log(`  ${st.id.padEnd(8)} ${st.name.padEnd(32)} priority=${st.priority || '?'}  hours=${st.estimated_hours || 0}  assigned=${st.assigned_to || '?'}`);
+    if (running.length > 0) {
+      const runningNames = running.filter(r => !(st.requires || []).includes(r.id)).map(r => r.id);
+      if (runningNames.length > 0) {
+        console.log(`    (${runningNames.join(', ')} also running — ${st.id} has no dependency on it)`);
+      }
+    }
+  }
+  console.log('');
+}
+
+function subtaskParallel(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  const subtasks = task.subtasks || [];
+  if (subtasks.length === 0) {
+    console.log(`\nNo subtasks defined for ${taskId}.\n`);
+    return;
+  }
+
+  console.log(`\nParallel plan for ${taskId}: ${task.name}\n`);
+
+  // Compute waves using subtask statuses
+  const done = new Set(subtasks.filter(s => s.status === 'done').map(s => s.id));
+  const pending = subtasks.filter(s => s.status === 'pending');
+  const waves = [];
+  const placed = new Set([...done]);
+
+  let remaining = [...pending];
+  while (remaining.length > 0) {
+    const wave = remaining.filter(s => (s.requires || []).every(dep => placed.has(dep)));
+    if (wave.length === 0) break;
+    waves.push(wave);
+    for (const s of wave) placed.add(s.id);
+    remaining = remaining.filter(s => !placed.has(s.id));
+  }
+
+  // Also include running subtasks as their own group
+  const running = subtasks.filter(s => s.status === 'running');
+  if (running.length > 0) {
+    console.log(`Currently running:`);
+    for (const s of running) console.log(`  ${s.id} [${s.name}, ${s.estimated_hours || 0}h]`);
+    console.log('');
+  }
+
+  for (let i = 0; i < waves.length; i++) {
+    const wave = waves[i];
+    const prereqs = [...new Set(wave.flatMap(s => s.requires || []))];
+    const label = i === 0
+      ? `Wave 1 (NOW)`
+      : `Wave ${i + 1} (after ${prereqs.join(' + ')})`;
+    const afterNote = wave.length > 1 ? '  ← these can run simultaneously' : '';
+    console.log(`${label}:`);
+    for (const s of wave) {
+      console.log(`  ${s.id} [${s.name}, ${s.estimated_hours || 0}h]`);
+    }
+    if (wave.length > 1) console.log(`  ← these ${wave.length} can run simultaneously`);
+    console.log('');
+  }
+
+  const allPending = subtasks.filter(s => !['done','skipped','cancelled'].includes(s.status));
+  const sequential = allPending.reduce((sum, s) => sum + (s.estimated_hours || 0), 0);
+
+  // Minimum parallel: sum of max per wave
+  const waveMaxes = waves.map(w => Math.max(...w.map(s => s.estimated_hours || 0)));
+  const minParallel = waveMaxes.reduce((a, b) => a + b, 0);
+
+  const cp = computeCriticalPath(subtasks);
+  const cpPending = cp.path.filter(id => {
+    const s = subtasks.find(x => x.id === id);
+    return s && !['done','skipped','cancelled'].includes(s.status);
+  });
+
+  console.log(`Minimum parallel time: ${minParallel}h | Sequential: ${sequential}h`);
+  if (cpPending.length > 0) console.log(`Critical path: ${cpPending.join(' → ')} (${cp.totalHours}h)\n`);
+}
+
+function subtaskImpact(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+  const subtasks = task.subtasks || [];
+
+  const { direct, transitive } = getSubtaskDownstream(stId, subtasks);
+
+  console.log(`\nImpact analysis: ${taskId} / ${stId} "${st.name}"\n`);
+  console.log(`Within ${taskId}:`);
+  if (direct.length > 0) {
+    const transitiveOnly = transitive.filter(s => !direct.find(d => d.id === s.id));
+    console.log(`  Directly depends on ${stId}: ${direct.map(s => s.id).join(', ')}${transitiveOnly.length > 0 ? ` (transitively: ${transitiveOnly.map(s => s.id).join(', ')})` : ''}`);
+  } else {
+    console.log(`  No subtasks directly depend on ${stId}.`);
+  }
+  const total = direct.length + transitive.length;
+  if (total > 0) console.log(`  ⚠️  Changing ${stId} puts ${total} subtask${total > 1 ? 's' : ''} at risk within this task.`);
+
+  // Task-level downstream
+  const { direct: taskDirect, transitive: taskTransitive } = getDownstream(taskId, plan.tasks);
+  const allTaskDown = [...taskDirect, ...taskTransitive];
+  if (allTaskDown.length > 0) {
+    console.log(`\nIf ${taskId} itself fails as a result:`);
+    console.log(`  Task-level downstream: ${allTaskDown.map(t => `${t.id} (${t.name})`).join(', ')}`);
+    console.log(`  ⚠️  Total blast radius: ${total} subtask${total !== 1 ? 's' : ''} + ${allTaskDown.length} downstream task${allTaskDown.length !== 1 ? 's' : ''}.`);
+  }
+
+  if (st.rollback) console.log(`\nRollback for ${stId}: ${st.rollback}`);
+  console.log('');
+}
+
+function subtaskStart(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  if (st.status === 'running') die(`Subtask "${stId}" is already running`);
+  if (st.status === 'done') die(`Subtask "${stId}" is already done`);
+
+  const subtasks = task.subtasks || [];
+
+  // Check all requires are done
+  const depResults = [];
+  let allOk = true;
+  for (const dep of (st.requires || [])) {
+    const depSt = subtasks.find(s => s.id === dep);
+    if (!depSt) { depResults.push(`${dep} ❓(not found)`); allOk = false; continue; }
+    if (depSt.status === 'done') {
+      depResults.push(`${dep} ✅`);
+    } else {
+      depResults.push(`${dep} ${statusIcon(depSt.status)} [${depSt.status}]`);
+      allOk = false;
+    }
+  }
+
+  if (!allOk) {
+    die(`Cannot start "${stId}" — required subtasks not complete:\n  ${depResults.join('\n  ')}`);
+  }
+
+  st.status = 'running';
+  st.started_at = nowIso();
+  savePlan(dir, plan);
+
+  console.log(`\n▶ Starting ${taskId} / ${stId}: ${st.name}`);
+  if (st.acceptance_criteria && st.acceptance_criteria.length > 0) {
+    console.log(`\n  Acceptance criteria (must all pass before marking done):`);
+    for (const c of st.acceptance_criteria) console.log(`  ✓ ${c}`);
+  }
+  if (depResults.length > 0) {
+    console.log(`\n  Requires: ${depResults.join(', ')}`);
+  }
+  console.log('');
+}
+
+function subtaskDone(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const confirm = args.confirm === true || args.confirm === 'true';
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  if (st.status === 'done') die(`Subtask "${stId}" is already done`);
+
+  console.log(`\n✅ Completing ${taskId} / ${stId}: ${st.name}\n`);
+
+  if (st.acceptance_criteria && st.acceptance_criteria.length > 0) {
+    console.log('Acceptance criteria:');
+    for (const c of st.acceptance_criteria) console.log(`  ✓ ${c}`);
+    console.log('');
+    if (!confirm) console.log('(Use --confirm to skip interactive check)\n');
+  }
+
+  const duration = st.started_at ? formatDuration(st.started_at, nowIso()) : '—';
+  st.status = 'done';
+  st.completed_at = nowIso();
+  if (!st.started_at) st.started_at = nowIso();
+
+  console.log(`Subtask marked done. Duration: ${duration}\n`);
+
+  // Show newly runnable subtasks
+  const subtasks = task.subtasks || [];
+  const nowDone = new Set(subtasks.filter(s => ['done','skipped','cancelled'].includes(s.status)).map(s => s.id));
+  const newlyReady = subtasks.filter(s =>
+    s.id !== stId && s.status === 'pending' &&
+    (s.requires || []).every(dep => nowDone.has(dep)) &&
+    (s.requires || []).includes(stId)
+  );
+  if (newlyReady.length > 0) {
+    console.log(`Newly runnable subtasks: ${newlyReady.map(s => `${s.id} (${s.name})`).join(', ')}`);
+  }
+
+  const stDone = subtasks.filter(s => ['done','skipped','cancelled'].includes(s.status)).length;
+  const stTotal = subtasks.length;
+  console.log(`[${stDone}/${stTotal} subtasks done in ${taskId}]`);
+
+  // Auto-complete parent task if all subtasks done
+  const allComplete = subtasks.every(s => ['done','skipped','cancelled'].includes(s.status));
+  if (allComplete && task.status !== 'done') {
+    task.status = 'done';
+    task.completed_at = nowIso();
+    if (!task.started_at) task.started_at = nowIso();
+    savePlan(dir, plan);
+    console.log(`\nAll subtasks complete → ${taskId} automatically marked done`);
+
+    // Show newly unblocked tasks at task level
+    const unblocked = plan.tasks.filter(t =>
+      (t.requires || []).includes(taskId) && t.status === 'pending'
+    );
+    if (unblocked.length > 0) {
+      const nowTaskDone = new Set(plan.tasks.filter(t => t.status === 'done').map(t => t.id));
+      const readyNow = unblocked.filter(t => (t.requires || []).every(dep => nowTaskDone.has(dep)));
+      if (readyNow.length > 0) {
+        console.log(`Tasks now unblocked: ${readyNow.map(t => `${t.id} (${t.name})`).join(', ')}`);
+      }
+    }
+  } else {
+    savePlan(dir, plan);
+  }
+  console.log('');
+}
+
+function subtaskFail(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const reason = args.reason || '(no reason given)';
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  st.status = 'failed';
+  st.blocker = reason;
+  savePlan(dir, plan);
+
+  const subtasks = task.subtasks || [];
+  const { direct, transitive } = getSubtaskDownstream(stId, subtasks);
+
+  console.log(`\n❌ ${taskId} / ${stId} FAILED: ${st.name}`);
+  console.log(`   Reason: ${reason}`);
+  if (st.rollback) console.log(`\n   Rollback: ${st.rollback}`);
+
+  if (direct.length + transitive.length > 0) {
+    console.log(`\n   Within ${taskId}, this blocks:`);
+    for (const s of direct) console.log(`     ${s.id} ${s.name} (direct)`);
+    for (const s of transitive) console.log(`     ${s.id} ${s.name} (transitive)`);
+  }
+
+  const { direct: td, transitive: tt } = getDownstream(taskId, plan.tasks);
+  const allDown = [...td, ...tt];
+  if (allDown.length > 0) {
+    console.log(`\n   If ${taskId} cannot recover, downstream tasks affected:`);
+    console.log(`     ${allDown.map(t => t.id).join(', ')}`);
+  }
+
+  console.log(`\n   Suggested: fix issue then run \`plan.cjs subtask retry --task ${taskId} --id ${stId}\``);
+  console.log('');
+}
+
+function subtaskBlock(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const reason = args.reason || '(no reason given)';
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  st.status = 'blocked';
+  st.blocker = reason;
+  savePlan(dir, plan);
+
+  console.log(`🔴 ${taskId} / ${stId} blocked: ${st.name}`);
+  console.log(`   Reason: ${reason}\n`);
+}
+
+function subtaskUnblock(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  st.status = 'pending';
+  st.blocker = null;
+  savePlan(dir, plan);
+
+  console.log(`✅ ${taskId} / ${stId} unblocked: ${st.name} → status=pending`);
+  const ready = getReadySubtasks(task.subtasks || []);
+  if (ready.find(s => s.id === stId)) console.log(`   All dependencies satisfied — ready to start!`);
+  console.log('');
+}
+
+function subtaskRetry(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  st.status = 'pending';
+  st.blocker = null;
+  st.started_at = null;
+  st.completed_at = null;
+  savePlan(dir, plan);
+
+  console.log(`🔄 ${taskId} / ${stId} reset to pending: ${st.name}\n`);
+}
+
+function subtaskNote(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const text = args._[1] || args.text || '';
+  if (!text) die('Note text is required (positional arg or --text)');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  st.notes = st.notes || [];
+  st.notes.push({ ts: nowIso(), text });
+  savePlan(dir, plan);
+
+  console.log(`📝 Note added to ${taskId} / ${stId}: "${text}"\n`);
+}
+
+function subtaskUpdate(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const stId = args.id;
+  if (!stId) die('--id is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+  const st = findSubtask(task, stId);
+
+  const updated = [];
+  if (args.assigned) { st.assigned_to = args.assigned; updated.push('assigned_to'); }
+  if (args.hours) { st.estimated_hours = parseFloat(args.hours); updated.push('estimated_hours'); }
+  if (args.priority) { st.priority = args.priority; updated.push('priority'); }
+  if (args.description) { st.description = args.description; updated.push('description'); }
+
+  if (updated.length === 0) die('No fields to update. Use --assigned, --hours, --priority, --description');
+
+  savePlan(dir, plan);
+  console.log(`✏️  Updated ${taskId} / ${stId} "${st.name}": ${updated.join(', ')}\n`);
+}
+
+function subtaskGraph(args) {
+  const taskId = args.task;
+  if (!taskId) die('--task is required');
+  const project = args.project;
+  const dir = resolveProjectDir(project);
+  const plan = loadPlan(dir);
+  const task = findTask(plan, taskId);
+
+  const subtasks = task.subtasks || [];
+  if (subtasks.length === 0) {
+    console.log(`\nNo subtasks defined for ${taskId}.\n`);
+    return;
+  }
+
+  console.log(`\nSubtask graph: ${taskId} — ${task.name}\n`);
+
+  const byId = {};
+  for (const s of subtasks) byId[s.id] = s;
+  const order = topoSort(subtasks);
+
+  // Level computation
+  const level = {};
+  for (const id of order) {
+    const s = byId[id];
+    const depLevels = (s.requires || []).map(d => level[d] ?? 0);
+    level[id] = depLevels.length ? Math.max(...depLevels) + 1 : 0;
+  }
+
+  function stLabel(id) {
+    const s = byId[id];
+    if (!s) return `[${id}]`;
+    const icon = statusIcon(s.status);
+    const shortName = s.name.length > 12 ? s.name.slice(0, 12) : s.name;
+    return `[${id} ${icon} ${shortName}]`;
+  }
+
+  const maxLevel = Math.max(...Object.values(level), 0);
+  const levelGroups = {};
+  for (let i = 0; i <= maxLevel; i++) levelGroups[i] = [];
+  for (const id of order) levelGroups[level[id]].push(id);
+
+  for (let lvl = 0; lvl <= maxLevel; lvl++) {
+    for (const id of levelGroups[lvl]) {
+      const s = byId[id];
+      const label = stLabel(id);
+      const dependents = subtasks.filter(x => (x.requires || []).includes(id));
+      if (dependents.length > 0) {
+        const depLabels = dependents.map(d => stLabel(d.id));
+        if (depLabels.length === 1) {
+          console.log(`${label} ──> ${depLabels[0]}`);
+        } else {
+          console.log(`${label} ──┬──> ${depLabels[0]}`);
+          for (let i = 1; i < depLabels.length; i++) {
+            const prefix = ' '.repeat(label.length + 2);
+            const arrow = i === depLabels.length - 1 ? '└──>' : '├──>';
+            console.log(`${prefix}${arrow} ${depLabels[i]}`);
+          }
+        }
+      } else {
+        if ((s.requires || []).length === 0 && dependents.length === 0) {
+          console.log(`${label}`);
+        }
+      }
+    }
+  }
+
+  console.log('\nLegend: ✅ done  ▶ running  ⏳ pending  🔴 blocked  ❌ failed\n');
+}
+
+function cmdSubtask(args) {
+  const sub = args._[0];
+  const subcmds = {
+    add: subtaskAdd,
+    import: subtaskImport,
+    list: subtaskList,
+    start: subtaskStart,
+    done: subtaskDone,
+    fail: subtaskFail,
+    block: subtaskBlock,
+    unblock: subtaskUnblock,
+    retry: subtaskRetry,
+    note: subtaskNote,
+    next: subtaskNext,
+    parallel: subtaskParallel,
+    impact: subtaskImpact,
+    graph: subtaskGraph,
+    update: subtaskUpdate,
+  };
+  if (!subcmds[sub]) die(`Unknown subtask subcommand: "${sub}". Valid: ${Object.keys(subcmds).join(', ')}`);
+  subcmds[sub](args);
+}
+
+// ─────────────────────────────────────────────
 // Main dispatch
 // ─────────────────────────────────────────────
 
@@ -1391,6 +2222,7 @@ const commands = {
   parallel: cmdParallel,
   report: cmdReport,
   list: cmdList,
+  subtask: cmdSubtask,
 };
 
 if (!commands[cmd]) {

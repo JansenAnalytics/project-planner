@@ -131,6 +131,59 @@ for (const t of tasks) {
   if (!t.name) errors.push(`Task "${t.id}" has no name`);
 }
 
+// 7. Subtask validation
+function detectSubtaskCycles(subtasks) {
+  const stById = {};
+  for (const s of subtasks) stById[s.id] = s;
+  const WHITE = 0, GRAY = 1, BLACK = 2;
+  const color = {};
+  for (const s of subtasks) color[s.id] = WHITE;
+  function dfs(id, stack) {
+    if (!stById[id]) return null;
+    color[id] = GRAY;
+    for (const dep of (stById[id].requires || [])) {
+      if (color[dep] === GRAY) return `Subtask cycle: ${[...stack, dep].join(' → ')}`;
+      if (color[dep] === WHITE) { const r = dfs(dep, [...stack, dep]); if (r) return r; }
+    }
+    color[id] = BLACK;
+    return null;
+  }
+  for (const s of subtasks) {
+    if (color[s.id] === WHITE) { const err = dfs(s.id, [s.id]); if (err) return err; }
+  }
+  return null;
+}
+
+for (const t of tasks) {
+  const subtasks = t.subtasks || [];
+  if (subtasks.length === 0) continue;
+
+  // a. Unique subtask IDs within parent task
+  const stSeenIds = new Set();
+  for (const st of subtasks) {
+    if (!st.id) { errors.push(`Task "${t.id}" has a subtask missing "id"`); continue; }
+    if (stSeenIds.has(st.id)) errors.push(`Task "${t.id}" has duplicate subtask ID: "${st.id}"`);
+    stSeenIds.add(st.id);
+  }
+
+  // b. All subtask requires exist within same task
+  for (const st of subtasks) {
+    for (const dep of (st.requires || [])) {
+      if (!stSeenIds.has(dep)) {
+        errors.push(`Task "${t.id}" subtask "${st.id}" requires "${dep}" which doesn't exist in the same task`);
+      }
+    }
+  }
+
+  // c. No cycles within subtask group
+  const cycleErr = detectSubtaskCycles(subtasks);
+  if (cycleErr) errors.push(`Task "${t.id}": ${cycleErr}`);
+
+  // d. At least one subtask with no requires (must be a root)
+  const roots = subtasks.filter(st => (st.requires || []).length === 0);
+  if (roots.length === 0) errors.push(`Task "${t.id}" has subtasks but none have empty requires (no root subtask)`);
+}
+
 // Report
 console.log(`\nValidating: ${project} (${tasks.length} tasks)\n`);
 
